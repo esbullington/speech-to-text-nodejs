@@ -33,7 +33,7 @@ function Microphone(_options) {
   this.requestedAccess = false;
   this.sampleRate = 16000;
   // auxiliar buffer to keep unused samples (used when doing downsampling)
-  this.bufferUnusedSamples = new Float32Array(0);
+  this.unusedSamples = new Float32Array(0);
 
   // Chrome or Firefox or IE User media
   if (!navigator.getUserMedia) {
@@ -56,6 +56,102 @@ Microphone.prototype.onPermissionRejected = function() {
 Microphone.prototype.onError = function(error) {
   console.log('Microphone.onError():', error);
 };
+
+
+var downsampleBuffer = function (buffer, sampleRate, outSampleRate) {
+    if (outSampleRate == sampleRate) {
+        return buffer;
+    }
+    if (outSampleRate > sampleRate) {
+        throw "downsampling rate show be smaller than original sample rate";
+    }
+    var sampleRateRatio = sampleRate / outSampleRate;
+    var newLength = Math.round(buffer.length / sampleRateRatio);
+    var result = new Int16Array(newLength);
+    var offsetResult = 0;
+    var offsetBuffer = 0;
+    while (offsetResult < result.length) {
+        var nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        var accum = 0, count = 0;
+        for (var i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+            accum += buffer[i];
+            count++;
+        }
+
+        result[offsetResult] = Math.min(1, accum / count)*0x7FFF;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+    }
+    return result.buffer;
+}
+
+var downsampleTwo = function(bufferNewSamples, sampleRate) {
+  var newTotalLength = this.unusedSamples.length + bufferNewSamples.length;
+  var newArrayBuffer = new Float32Array(newTotalLength);
+  for (var i = 0; i < this.unusedSamples.length; i++) {
+    newArrayBuffer[i] = this.unusedSamples[i];
+  }
+  for (var j = 0; j < bufferNewSamples.length; j++) {
+    newArrayBuffer[j + this.unusedSamples.length] = bufferNewSamples[j];
+  }
+  this.unusedSamples = newArrayBuffer;
+  var buffer = null,
+    newSamples = bufferNewSamples.length,
+    // unusedSamples = this.bufferUnusedSamples.length;
+
+  // if (unusedSamples > 0) {
+  //   buffer = new Float32Array(newSamples);
+  //   for (var i = 0; i < unusedSamples; ++i) {
+  //     buffer[i] = this.bufferUnusedSamples[i];
+  //   }
+  //   for (i = 0; i < newSamples; ++i) {
+  //     buffer[unusedSamples + i] = bufferNewSamples[i];
+  //   }
+  // } else {
+  //   buffer = bufferNewSamples;
+  // }
+  buffer = bufferNewSamples;
+
+  // downsampling variables
+  var filter = [
+      -0.037935, -0.00089024, 0.040173, 0.019989, 0.0047792, -0.058675, -0.056487,
+      -0.0040653, 0.14527, 0.26927, 0.33913, 0.26927, 0.14527, -0.0040653, -0.056487,
+      -0.058675, 0.0047792, 0.019989, 0.040173, -0.00089024, -0.037935
+    ],
+    samplingRateRatio = sampleRate / 16000,
+    nOutputSamples = Math.floor((buffer.length - filter.length) / (samplingRateRatio)) + 1,
+    pcmEncodedBuffer16k = new ArrayBuffer(nOutputSamples * 2),
+    dataView16k = new DataView(pcmEncodedBuffer16k),
+    index = 0,
+    volume = 0x7FFF, //range from 0 to 0x7FFF to control the volume
+    nOut = 0;
+
+  for (var i = 0; i + filter.length - 1 < buffer.length; i = Math.round(samplingRateRatio * nOut)) {
+    var sample = 0;
+    for (var j = 0; j < filter.length; ++j) {
+      sample += buffer[i + j] * filter[j];
+    }
+    sample *= volume;
+    dataView16k.setInt16(index, sample, true); // 'true' -> means little endian
+    index += 2;
+    nOut++;
+  }
+
+  // var indexSampleAfterLastUsed = Math.round(samplingRateRatio * nOut);
+  // var remaining = buffer.length - indexSampleAfterLastUsed;
+  // if (remaining > 0) {
+  //   this.bufferUnusedSamples = new Float32Array(remaining);
+  //   for (i = 0; i < remaining; ++i) {
+  //     this.bufferUnusedSamples[i] = buffer[indexSampleAfterLastUsed + i];
+  //   }
+  // } else {
+  //   this.bufferUnusedSamples = new Float32Array(0);
+  // }
+
+  return new Blob([dataView16k], {
+    type: 'audio/l16'
+  });
+}
 
 /**
  * Called when the user authorizes the use of the microphone.
@@ -108,10 +204,12 @@ Microphone.prototype._onaudioprocess = function(data) {
   var chan = data.inputBuffer.getChannelData(0);
 
   this.onAudio(this._exportDataBufferTo16Khz(new Float32Array(chan)));
-
-  //export with microphone mhz, remember to update the this.sampleRate
-  // with the sample rate from your microphone
-  // this.onAudio(this._exportDataBuffer(new Float32Array(chan)));
+  // Other downsampling experiments
+  // var self = this;
+  // var downSampled = downsampleBuffer(chan, 44100, 16000);
+  // var sampleRate = this.audioContext.sampleRate;
+  // var downSampled = downsampleTwo(new Float32Array(chan), sampleRate);
+  // this.onAudio(downSampled);
 
 };
 
@@ -133,6 +231,56 @@ Microphone.prototype.record = function() {
     this.onPermissionRejected.bind(this)); // Microphone permission rejected
 };
 
+function floatTo16BitPCM(output, offset, input){
+  for (var i = 0; i < input.length; i++, offset+=2){
+    var s = Math.max(-1, Math.min(1, input[i]));
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+}
+
+function writeString(view, offset, string){
+  for (var i = 0; i < string.length; i++){
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+function encodeWAV(samples){
+  var numChannels = 1;
+  var sampleRate = 44100;
+  var buffer = new ArrayBuffer(44 + samples.length * 2);
+  var view = new DataView(buffer);
+
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* RIFF chunk length */
+  view.setUint32(4, 36 + samples.length * 2, true);
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, 1, true);
+  /* channel count */
+  view.setUint16(22, numChannels, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, sampleRate * 4, true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, numChannels * 2, true);
+  /* bits per sample */
+  view.setUint16(34, 16, true);
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
+  view.setUint32(40, samples.length * 2, true);
+
+  floatTo16BitPCM(view, 44, samples);
+
+  return view;
+}
 /**
  * Stop the audio recording
  */
@@ -145,6 +293,37 @@ Microphone.prototype.stop = function() {
   this.mic.disconnect(0);
   this.mic = null;
   this.onStopRecording();
+
+  var view = encodeWAV(this.unusedSamples);
+
+  // our final binary blob that we can hand off
+  var blob = new Blob ( [ view ], { type : 'audio/wav' } );
+  var audio = new Audio();
+  var objectURL = URL.createObjectURL(blob);
+  audio.src = objectURL;
+  audio.addEventListener('error', function failed(e) {
+       // audio playback failed - show a message saying why
+       // to get the source of the audio element use $(this).src
+       switch (e.target.error.code) {
+         case e.target.error.MEDIA_ERR_ABORTED:
+           console.log('You aborted the video playback.');
+           break;
+         case e.target.error.MEDIA_ERR_NETWORK:
+           console.log('A network error caused the audio download to fail.');
+           break;
+         case e.target.error.MEDIA_ERR_DECODE:
+           console.log('The audio playback was aborted due to a corruption problem or because the video used features your browser did not support.');
+           break;
+         case e.target.error.MEDIA_ERR_SRC_NOT_SUPPORTED:
+           console.log('The video audio not be loaded, either because the server or network failed or because the format is not supported.');
+           break;
+         default:
+           console.log('An unknown error occurred.');
+           break;
+       }
+     }, true);
+  audio.play();
+  console.log('FINAL COUNT', this.unusedSamples.length);
 };
 
 /**
@@ -159,21 +338,31 @@ Microphone.prototype.stop = function() {
  * @deprecated This method is depracated
  */
 Microphone.prototype._exportDataBufferTo16Khz = function(bufferNewSamples) {
+  var newTotalLength = this.unusedSamples.length + bufferNewSamples.length;
+  var newArrayBuffer = new Float32Array(newTotalLength);
+  for (var i = 0; i < this.unusedSamples.length; i++) {
+    newArrayBuffer[i] = this.unusedSamples[i];
+  }
+  for (var j = 0; j < bufferNewSamples.length; j++) {
+    newArrayBuffer[j + this.unusedSamples.length] = bufferNewSamples[j];
+  }
+  this.unusedSamples = newArrayBuffer;
   var buffer = null,
     newSamples = bufferNewSamples.length,
-    unusedSamples = this.bufferUnusedSamples.length;
+    // unusedSamples = this.bufferUnusedSamples.length;
 
-  if (unusedSamples > 0) {
-    buffer = new Float32Array(unusedSamples + newSamples);
-    for (var i = 0; i < unusedSamples; ++i) {
-      buffer[i] = this.bufferUnusedSamples[i];
-    }
-    for (i = 0; i < newSamples; ++i) {
-      buffer[unusedSamples + i] = bufferNewSamples[i];
-    }
-  } else {
-    buffer = bufferNewSamples;
-  }
+  // if (unusedSamples > 0) {
+  //   buffer = new Float32Array(newSamples);
+  //   for (var i = 0; i < unusedSamples; ++i) {
+  //     buffer[i] = this.bufferUnusedSamples[i];
+  //   }
+  //   for (i = 0; i < newSamples; ++i) {
+  //     buffer[unusedSamples + i] = bufferNewSamples[i];
+  //   }
+  // } else {
+  //   buffer = bufferNewSamples;
+  // }
+  buffer = bufferNewSamples;
 
   // downsampling variables
   var filter = [
@@ -200,16 +389,16 @@ Microphone.prototype._exportDataBufferTo16Khz = function(bufferNewSamples) {
     nOut++;
   }
 
-  var indexSampleAfterLastUsed = Math.round(samplingRateRatio * nOut);
-  var remaining = buffer.length - indexSampleAfterLastUsed;
-  if (remaining > 0) {
-    this.bufferUnusedSamples = new Float32Array(remaining);
-    for (i = 0; i < remaining; ++i) {
-      this.bufferUnusedSamples[i] = buffer[indexSampleAfterLastUsed + i];
-    }
-  } else {
-    this.bufferUnusedSamples = new Float32Array(0);
-  }
+  // var indexSampleAfterLastUsed = Math.round(samplingRateRatio * nOut);
+  // var remaining = buffer.length - indexSampleAfterLastUsed;
+  // if (remaining > 0) {
+  //   this.bufferUnusedSamples = new Float32Array(remaining);
+  //   for (i = 0; i < remaining; ++i) {
+  //     this.bufferUnusedSamples[i] = buffer[indexSampleAfterLastUsed + i];
+  //   }
+  // } else {
+  //   this.bufferUnusedSamples = new Float32Array(0);
+  // }
 
   return new Blob([dataView16k], {
     type: 'audio/l16'
@@ -254,4 +443,3 @@ Microphone.prototype.onStopRecording =  function() {};
 Microphone.prototype.onAudio =  function() {};
 
 module.exports = Microphone;
-
